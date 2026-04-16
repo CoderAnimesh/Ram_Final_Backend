@@ -4,6 +4,14 @@ import { workers, users, complaints } from '../db/schema.js';
 import { eq, and } from 'drizzle-orm';
 import { requireAdmin, verifyToken } from '../middleware/auth.js';
 import admin from 'firebase-admin';
+import multer from 'multer';
+import { uploadToCloudinary } from '../utils/cloudinary.js';
+import { verifyLiveImage, compareImages } from '../utils/gemini.js';
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+});
 
 const router = Router();
 
@@ -114,20 +122,53 @@ router.get('/my-complaints', verifyToken, async (req, res) => {
 });
 
 // PATCH /workers/complete-complaint/:id
-router.patch('/complete-complaint/:id', verifyToken, async (req, res) => {
+router.patch('/complete-complaint/:id', verifyToken, upload.single('image'), async (req, res) => {
   try {
     const worker = await db.select().from(workers).where(eq(workers.firebaseUid, req.user.uid)).limit(1);
     if (!worker.length) return res.status(403).json({ error: 'Not a worker' });
 
+    if (!req.file) {
+      return res.status(400).json({ error: 'Resolved live image is required' });
+    }
+
+    const complaintRec = await db.select().from(complaints).where(eq(complaints.id, req.params.id)).limit(1);
+    if (!complaintRec.length || complaintRec[0].workerId !== worker[0].id) {
+      return res.status(404).json({ error: 'Complaint not found or not assigned to you' });
+    }
+
+    // Verify it's a live photo
+    const verification = await verifyLiveImage(req.file.buffer, req.file.mimetype);
+    if (!verification.isLive) {
+      return res.status(400).json({ error: `Image verification failed: ${verification.reason}` });
+    }
+
+    // Similarity Check
+    let similarityScore = null;
+    if (complaintRec[0].photoUrl) {
+      try {
+        const image1Resp = await fetch(complaintRec[0].photoUrl);
+        const arrayBuffer = await image1Resp.arrayBuffer();
+        const image1Buffer = Buffer.from(arrayBuffer);
+        const mime1 = image1Resp.headers.get('content-type') || 'image/jpeg';
+        
+        similarityScore = await compareImages(image1Buffer, mime1, req.file.buffer, req.file.mimetype);
+      } catch (err) {
+        console.error('Failed to compare images:', err);
+      }
+    }
+
+    // Upload to Cloudinary
+    const uploadResult = await uploadToCloudinary(req.file.buffer, 'complaints_resolved');
+    const resolvedPhotoUrl = uploadResult.secure_url;
+
     const updated = await db.update(complaints)
-      .set({ status: 'reverification', reverificationAt: new Date(), updatedAt: new Date() })
+      .set({ status: 'reverification', reverificationAt: new Date(), updatedAt: new Date(), resolvedPhotoUrl, similarityScore })
       .where(and(eq(complaints.id, req.params.id), eq(complaints.workerId, worker[0].id)))
       .returning();
 
-    if (!updated.length) return res.status(404).json({ error: 'Complaint not found or not assigned to you' });
-
     res.json({ success: true, complaint: updated[0] });
   } catch (err) {
+    console.error('Failed to complete complaint:', err);
     res.status(500).json({ error: 'Failed to complete complaint' });
   }
 });

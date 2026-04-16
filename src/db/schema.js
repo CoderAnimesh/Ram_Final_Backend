@@ -42,6 +42,8 @@ export const complaints = pgTable('complaints', {
   category: varchar('category', { length: 100 }).notNull(),
   description: text('description').notNull(),
   photoUrl: text('photo_url'),
+  resolvedPhotoUrl: text('resolved_photo_url'),
+  similarityScore: integer('similarity_score'),
 
   // Status flow: pending → assigned → reverification → resolved
   status: varchar('status', { length: 30 }).notNull().default('pending'),

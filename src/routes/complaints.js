@@ -3,6 +3,14 @@ import { db } from '../db/index.js';
 import { complaints, users, notifications } from '../db/schema.js';
 import { eq, desc } from 'drizzle-orm';
 import { verifyToken, requireAdmin } from '../middleware/auth.js';
+import multer from 'multer';
+import { uploadToCloudinary } from '../utils/cloudinary.js';
+import { verifyLiveImage } from '../utils/gemini.js';
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+});
 
 const router = Router();
 
@@ -13,12 +21,26 @@ async function getDbUser(firebaseUid) {
 }
 
 // POST /complaints — raise a new complaint (user)
-router.post('/', verifyToken, async (req, res) => {
+router.post('/', verifyToken, upload.single('image'), async (req, res) => {
   try {
     const dbUser = await getDbUser(req.user.uid);
     if (!dbUser) return res.status(404).json({ error: 'User not found' });
 
-    const { category, description, latitude, longitude, address, area, photoUrl } = req.body;
+    if (!req.file) {
+      return res.status(400).json({ error: 'Live image is required' });
+    }
+
+    // Verify it's a live photo
+    const verification = await verifyLiveImage(req.file.buffer, req.file.mimetype);
+    if (!verification.isLive) {
+      return res.status(400).json({ error: `Image verification failed: ${verification.reason}` });
+    }
+
+    // Upload to Cloudinary
+    const uploadResult = await uploadToCloudinary(req.file.buffer, 'complaints_problem');
+    const photoUrl = uploadResult.secure_url;
+
+    const { category, description, latitude, longitude, address, area } = req.body;
     const complaint = await db.insert(complaints).values({
       userId: dbUser.id,
       userName: dbUser.name,
@@ -29,7 +51,7 @@ router.post('/', verifyToken, async (req, res) => {
       longitude: String(longitude),
       address,
       area,
-      photoUrl: photoUrl || null,
+      photoUrl,
       status: 'pending',
     }).returning();
 
